@@ -1,0 +1,646 @@
+{
+  "name": "Content Production Workflow",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "42202e4b-18af-41a6-b1b4-4d04e73b6477",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 20 * * *"
+            },
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
+      },
+      "id": "79aef616-42bb-48fa-bc10-0f759476b571",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        16,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Genuinely global configuration only â detailed trend-scoring weights live\n// inside \"Normalize, Filter & Select Trend\" itself, next to the logic that\n// uses them, not duplicated here.\nconst jobId = $now.toFormat('yyyyLLdd-HHmmss') + '-' + Math.random().toString(36).slice(2, 8);\n\nreturn [{\n  json: {\n    jobId,\n    remotionProjectPath: '/data/crypto-video-engine-v2',\n    videoJobsPath: 'public/jobs',\n    outputPath: 'out/jobs',\n    searchQueryUsed: 'crypto',\n    freshnessHours: 12,\n    minTrendScoreToWin: 25,\n    dedupTtlDays: 7,\n    maxTweetsPerAuthor: 3,\n    maxGroqAttempts: 2,\n  },\n}];"
+      },
+      "id": "169425a8-c52b-41fc-b1ec-90138dc18c8f",
+      "name": "Job Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        176,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://twitter-aio.p.rapidapi.com/search/crypto",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "crypto"
+            },
+            {
+              "name": "count",
+              "value": "50"
+            },
+            {
+              "name": "type",
+              "value": "Latest"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-rapidapi-host",
+              "value": "twitter-aio.p.rapidapi.com"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "b9658c6f-b5bc-4b17-9ad1-fbe84445eabd",
+      "name": "Fetch Crypto Posts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        208,
+        336
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_N8N_CREDENTIAL_ID",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// CONFIG\n// ============================================================\nconst WEIGHTS = { engagement: 1.0, velocity: 1.6, recency: 1.2, newsworthiness: 1.0, confirmation: 1.4, sourceQuality: 0.6 };\nconst CLUSTER_MIN_SHARED_KEYWORDS_SAME_TOKEN = 2;\nconst CLUSTER_MIN_SHARED_KEYWORDS_NO_TOKEN_MATCH = 3;\nconst RECENCY_CEILING_HOURS = 48;\nconst FRESHNESS_TIERS = [\n  { name: 'tier1', maxHours: 12, trendLevel: 'breaking' },\n  { name: 'tier2', maxHours: 24, trendLevel: 'ongoing' },\n  { name: 'tier3', maxHours: 48, trendLevel: 'recent' },\n];\n\nconst config = $('Job Config').first().json;\n\n// ============================================================\n// 0. Detect an upstream request failure before touching the body at all â\n// a failed HTTP call (onError-style) or a non-object response must never\n// silently fall through to \"no candidates found -> evergreen\". A broken\n// fetch and \"genuinely no news today\" are different outcomes.\n// ============================================================\nconst raw = $input.first().json;\nif (raw && raw.error && !raw.entries && !raw.data && !raw.results && !raw.timeline && !raw.tweets) {\n  return [{\n    json: {\n      ...config,\n      contentStatus: 'source_request_failed',\n      mode: null,\n      totalRawResults: 0, totalTweetObjectsParsed: 0, candidateCount: 0, rejectedCount: 0,\n      apiResponseShapeDetected: 'error_response', searchQueryUsed: config.searchQueryUsed || null,\n    },\n  }];\n}\n\n// ---- 1-4: locate + normalize every post from the raw RapidAPI response ----\nfunction normalizeToArray(data) {\n  if (!data) return [];\n  if (Array.isArray(data)) return data;\n  if (typeof data === 'object') return Object.values(data);\n  return [];\n}\nfunction getSafeValue(obj, paths, fallback = null) {\n  for (const p of paths) {\n    try {\n      const value = p.split('.').reduce((acc, key) => {\n        if (acc == null) return undefined;\n        const arrayMatch = key.match(/^(.*)\\[(\\d+)\\]$/);\n        if (arrayMatch) {\n          const arr = acc[arrayMatch[1]];\n          return Array.isArray(arr) ? arr[Number(arrayMatch[2])] : undefined;\n        }\n        return acc[key];\n      }, obj);\n      if (value != null) return value;\n    } catch (_) { continue; }\n  }\n  return fallback;\n}\n// Recursively scans the ENTIRE response for tweet-shaped objects,\n// regardless of which top-level key they live under (entries, data,\n// results, timeline, tweets, or anything else) â does not assume any\n// particular root shape, per the requirement not to assume raw.entries.\nfunction extractTweetLikeObjects(node, collected = [], visited = new WeakSet()) {\n  if (node === null || typeof node !== 'object') return collected;\n  if (visited.has(node)) return collected;\n  visited.add(node);\n  const MARKERS = ['itemContent', 'tweet_results', 'legacy', 'full_text'];\n  if (Array.isArray(node)) {\n    for (const item of node) extractTweetLikeObjects(item, collected, visited);\n  } else {\n    const keys = Object.keys(node);\n    if (MARKERS.some((m) => keys.includes(m))) collected.push(node);\n    for (const key of keys) extractTweetLikeObjects(node[key], collected, visited);\n  }\n  return collected;\n}\n\nconst topLevelKeys = raw && typeof raw === 'object' ? Object.keys(raw).filter((k) => raw[k] != null) : [];\nconst apiResponseShapeDetected = topLevelKeys.length > 0 ? topLevelKeys.join(',') : 'empty_or_non_object_response';\n\nconst tweetNodes = [];\nextractTweetLikeObjects(raw, tweetNodes);\nconst totalTweetObjectsParsed = tweetNodes.length;\n\n// Best-effort count of raw items the provider actually sent, independent of\n// whether our extractor could parse them, so a real \"zero results\" from the\n// provider is distinguishable from \"we parsed 0 out of many\".\nconst totalRawResults = (() => {\n  for (const key of ['entries', 'data', 'results', 'timeline', 'tweets']) {\n    const val = raw && raw[key];\n    if (val != null) {\n      const arr = normalizeToArray(val);\n      if (arr.length > 0) return arr.length;\n    }\n  }\n  return totalTweetObjectsParsed;\n})();\n\nif (totalTweetObjectsParsed === 0) {\n  return [{\n    json: {\n      ...config,\n      contentStatus: 'source_data_error',\n      mode: null,\n      totalRawResults, totalTweetObjectsParsed: 0, candidateCount: 0, rejectedCount: 0,\n      apiResponseShapeDetected, searchQueryUsed: config.searchQueryUsed || null,\n    },\n  }];\n}\n\n// ---- Coin/project name detection â not just cashtags ----\nconst COIN_NAME_MAP = {\n  bitcoin: 'BTC',\n  ethereum: 'ETH', ether: 'ETH',\n  solana: 'SOL',\n  ripple: 'XRP', xrp: 'XRP',\n  dogecoin: 'DOGE',\n  cardano: 'ADA',\n  avalanche: 'AVAX',\n  chainlink: 'LINK',\n  polkadot: 'DOT',\n  litecoin: 'LTC',\n  polygon: 'MATIC',\n  tron: 'TRX',\n  toncoin: 'TON',\n  shiba: 'SHIB', 'shiba inu': 'SHIB',\n  tether: 'USDT',\n  'usd coin': 'USDC',\n};\nfunction detectCoinMentions(text) {\n  const found = new Set();\n  const cashtagMatches = text.match(/\\$[A-Za-z]{2,10}\\b/g) || [];\n  for (const m of cashtagMatches) found.add(m.slice(1).toUpperCase());\n  const lower = text.toLowerCase();\n  for (const [name, ticker] of Object.entries(COIN_NAME_MAP)) {\n    const re = new RegExp(`\\\\b${name.replace(/\\s+/g, '\\\\s+')}\\\\b`, 'i');\n    if (re.test(lower)) found.add(ticker);\n  }\n  return [...found];\n}\n\nconst posts = [];\nfor (const node of tweetNodes) {\n  const text = getSafeValue(node, [\n    'content.itemContent.tweet_results.result.legacy.full_text',\n    'tweet_results.result.legacy.full_text', 'legacy.full_text', 'full_text', 'text',\n  ]);\n  if (!text) continue;\n\n  const sourceId = getSafeValue(node, [\n    'content.itemContent.tweet_results.result.rest_id',\n    'tweet_results.result.rest_id', 'rest_id', 'id_str', 'id',\n  ]);\n  const createdAt = getSafeValue(node, [\n    'content.itemContent.tweet_results.result.legacy.created_at',\n    'tweet_results.result.legacy.created_at', 'legacy.created_at', 'created_at',\n    'content.itemContent.tweet_results.result.legacy.createdAt', 'createdAt', 'timestamp', 'created_time',\n  ]);\n  const likesRaw = getSafeValue(node, [\n    'content.itemContent.tweet_results.result.legacy.favorite_count',\n    'tweet_results.result.legacy.favorite_count', 'legacy.favorite_count', 'favorite_count', 'like_count', 'likes',\n  ], null);\n  const retweetsRaw = getSafeValue(node, [\n    'content.itemContent.tweet_results.result.legacy.retweet_count',\n    'tweet_results.result.legacy.retweet_count', 'legacy.retweet_count', 'retweet_count', 'retweets',\n  ], null);\n  const repliesRaw = getSafeValue(node, [\n    'content.itemContent.tweet_results.result.legacy.reply_count',\n    'tweet_results.result.legacy.reply_count', 'legacy.reply_count', 'reply_count', 'replies',\n  ], null);\n  const quotes = Number(getSafeValue(node, [\n    'content.itemContent.tweet_results.result.legacy.quote_count',\n    'tweet_results.result.legacy.quote_count', 'legacy.quote_count', 'quote_count',\n  ], 0)) || 0;\n  const views = getSafeValue(node, [\n    'content.itemContent.tweet_results.result.views.count',\n    'tweet_results.result.views.count', 'views.count',\n  ], null);\n  const authorHandle = getSafeValue(node, [\n    'content.itemContent.tweet_results.result.core.user_results.result.legacy.screen_name',\n    'tweet_results.result.core.user_results.result.legacy.screen_name',\n    'legacy.user.screen_name', 'user.screen_name', 'screen_name', 'author.username', 'username',\n  ], 'unknown');\n  const authorFollowers = getSafeValue(node, [\n    'content.itemContent.tweet_results.result.core.user_results.result.legacy.followers_count',\n    'tweet_results.result.core.user_results.result.legacy.followers_count', 'author.followers_count',\n  ], null);\n  const authorVerified = getSafeValue(node, [\n    'content.itemContent.tweet_results.result.core.user_results.result.legacy.verified',\n    'tweet_results.result.core.user_results.result.is_blue_verified', 'author.verified',\n  ], null);\n  const cashtag = getSafeValue(node, [\n    'content.itemContent.tweet_results.result.legacy.entities.cashtags[0].text',\n    'legacy.entities.cashtags[0].text',\n  ], '');\n  const hashtagsRaw = getSafeValue(node, [\n    'content.itemContent.tweet_results.result.legacy.entities.hashtags',\n    'legacy.entities.hashtags',\n  ], []);\n  const hashtags = Array.isArray(hashtagsRaw) ? hashtagsRaw.map((h) => h && h.text).filter(Boolean) : [];\n  const ageMinutes = createdAt ? (Date.now() - new Date(createdAt).getTime()) / 60000 : null;\n  const trimmedText = String(text).trim();\n  const detectedCoins = detectCoinMentions(trimmedText);\n\n  posts.push({\n    sourceId: sourceId || Buffer.from(trimmedText).toString('base64').slice(0, 20),\n    sourceType: 'x',\n    sourceUrl: sourceId && authorHandle !== 'unknown' ? `https://x.com/${authorHandle}/status/${sourceId}` : '',\n    text: trimmedText,\n    author: authorHandle,\n    authorFollowers: authorFollowers != null ? Number(authorFollowers) : null,\n    authorVerified: authorVerified != null ? Boolean(authorVerified) : null,\n    createdAt: createdAt || null,\n    ageMinutes: ageMinutes != null && !Number.isNaN(ageMinutes) ? ageMinutes : null,\n    likesRaw, retweetsRaw, repliesRaw,\n    likes: likesRaw != null ? Number(likesRaw) || 0 : 0,\n    retweets: retweetsRaw != null ? Number(retweetsRaw) || 0 : 0,\n    replies: repliesRaw != null ? Number(repliesRaw) || 0 : 0,\n    quotes,\n    views: views != null ? Number(views) : null,\n    token: (cashtag || '').toUpperCase() || (detectedCoins[0] || ''),\n    detectedCoins,\n    hashtags,\n    trendScore: 0,\n    trendLevel: '',\n    rejectionReasons: [],\n  });\n}\n\n// ---- 5-6: reject spam / low-quality, using workflow static data for dedup ----\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.processedIds) staticData.processedIds = {};\nif (!staticData.recentTopicHashes) staticData.recentTopicHashes = {};\nif (!staticData.flaggedAuthors) staticData.flaggedAuthors = {};\n\nconst now = Date.now();\nconst DEDUP_TTL_MS = (config.dedupTtlDays || 7) * 24 * 60 * 60 * 1000;\nconst FLAG_TTL_MS = 6 * 60 * 60 * 1000;\nfor (const k of Object.keys(staticData.processedIds)) if (now - staticData.processedIds[k] > DEDUP_TTL_MS) delete staticData.processedIds[k];\nfor (const k of Object.keys(staticData.recentTopicHashes)) if (now - staticData.recentTopicHashes[k] > DEDUP_TTL_MS) delete staticData.recentTopicHashes[k];\nfor (const k of Object.keys(staticData.flaggedAuthors)) if (now - staticData.flaggedAuthors[k] > FLAG_TTL_MS) delete staticData.flaggedAuthors[k];\n\nconst RE_ENGAGEMENT_BAIT = /\\b(f[\\W_]*o[\\W_]*l[\\W_]*l[\\W_]*o[\\W_]*w|r[\\W_]*e[\\W_]*t[\\W_]*w[\\W_]*e[\\W_]*e[\\W_]*t|\\brt\\b|d[\\W_]*m\\s*(me|us|for)|drop\\s*(your\\s*)?(wallet|address)|sub[\\W_]*scribe)\\b/i;\nconst RE_FINANCIAL_MANIP = /\\b(\\d{2,5}[xÃ]|to\\s+the\\s+moon|going\\s+moon|next\\s+gem|guaranteed\\s+(profit|return|gain)|can'?t\\s+miss|last\\s+chance|buy\\s+now|get\\s+in\\s+(now|early)|early\\s+investors?|this\\s+is\\s+it|secret\\s+(alpha|signal|call))\\b/i;\nconst RE_GIVEAWAY = /\\b(give[\\W_]*away|air[\\W_]*drop|pre[\\W_]*sale|lucky\\s+winner|entries?\\s+close|claim\\s+your|limited\\s+spots?|whitelist\\s+open|mint\\s+is\\s+(live|open)|free\\s+(tokens?|nft|crypto|coins?))\\b/i;\nconst RE_SUSP_LINKS = /(bit\\.ly|t\\.me\\/|tinyurl\\.com|linktr\\.ee|shorte\\.st|cutt\\.ly|rb\\.gy|ow\\.ly)(\\/\\S+)?/i;\nconst RE_BOT_COMMANDS = /\\b(join\\s+(our|the|my|this)\\s+(group|channel|community|telegram|discord|server)|check\\s+(pinned|bio|profile)|link\\s+in\\s+(bio|profile)|visit\\s+our|click\\s+below|comment\\s+(done|below)|tag\\s+\\d+\\s+friends?|share\\s+(this|to)\\s+(win|get))\\b/i;\nconst RE_CONVERSATIONAL = new RegExp([\n  'good\\\\s+(morning|evening|night|afternoon)', 'gm\\\\s+crypto', 'gm\\\\s+web3', 'gm\\\\s+fam', '^gm[!.\\\\s]*$',\n  'rise\\\\s+and\\\\s+shine', 'have\\\\s+a\\\\s+(great|good|wonderful|blessed)\\\\s+day',\n  'happy\\\\s+(monday|tuesday|wednesday|thursday|friday|weekend)',\n  'what\\\\s+do\\\\s+you\\\\s+think', 'hot\\\\s+take[:\\\\s]', 'unpopular\\\\s+opinion', 'agree\\\\s+or\\\\s+disagree',\n  'yes\\\\s+or\\\\s+no\\\\??', 'your\\\\s+thoughts\\\\??', 'am\\\\s+i\\\\s+(the\\\\s+only\\\\s+one|wrong|right)',\n  'who\\\\s+else\\\\s+(thinks|agrees|feels)', 'drop\\\\s+your\\\\s+(handle|wallet|address|nft)', 'best\\\\s+opportunity',\n  'follow\\\\s+me\\\\s+(for|if)', 'check\\\\s+out\\\\s+my', 'new\\\\s+video\\\\s+out', 'i\\\\s+just\\\\s+posted', 'thread\\\\s+below',\n  'believe\\\\s+in\\\\s+yourself', 'keep\\\\s+going', 'stay\\\\s+strong', 'never\\\\s+give\\\\s+up', 'mindset\\\\s+is\\\\s+everything',\n].join('|'), 'i');\n// Broadened per the requested topic list: exchanges, hacks/exploits, listings/delistings,\n// partnerships/launches/upgrades, whale/on-chain activity, ETFs, regulation, price action.\nconst RE_NEWS_SIGNAL = new RegExp([\n  '\\\\$[A-Z]{2,6}', '\\\\b(all[\\\\-\\\\s]?time\\\\s+high|ath|all[\\\\-\\\\s]?time\\\\s+low|atl)\\\\b',\n  '\\\\b(price|rally|crash|correction|pump|dump|surge|plunge|breakout|breakdown|volatility|dip)\\\\b',\n  '\\\\b(bull|bear)\\\\s+(run|market|trap|flag)\\\\b', '\\\\b(support|resistance|fibonacci|rsi|macd|volume)\\\\b',\n  '\\\\b(sec|cftc|fed|federal\\\\s+reserve|treasury|congress|senate|regulation|regulatory|lawsuit|settlement|ruling|approved?|rejected?|compliance|sanction)\\\\b',\n  '\\\\b(etf|spot\\\\s+etf|futures\\\\s+etf|approval|inflow|outflow)\\\\b',\n  '\\\\b(blackrock|fidelity|vanguard|jpmorgan|goldman|citadel|grayscale|coinbase|binance|kraken|okx|bybit|bitfinex|gemini|crypto\\\\.com|robinhood)\\\\b',\n  '\\\\b(upgrade|hard\\\\s+fork|soft\\\\s+fork|mainnet|testnet|launch|deploy|audit|exploit|hack|hacked|breach|vulnerability|bug|patch|fix|drain(ed)?|stolen)\\\\b',\n  '\\\\b(layer[\\\\s\\\\-]?[12]|l[12]|rollup|zk[\\\\s\\\\-]?proof|zkevm|optimism|arbitrum|polygon|lightning\\\\s+network)\\\\b',\n  '\\\\b(smart\\\\s+contract|defi|dex|cex|nft|dao|staking|yield|liquidity|liquidat(ed|ion)|tvl|protocol)\\\\b',\n  '\\\\b(partnership|acquisition|merger|funding|investment|venture|series\\\\s+[a-c]|ipo|token\\\\s+sale|ido|ico|listing|listed|delist(ed|ing)?)\\\\b',\n  '\\\\b(bankruptcy|insolvency|collapse|insolvent|chapter\\\\s+11|creditor)\\\\b',\n  '\\\\b(inflation|interest\\\\s+rate|gdp|recession|macro|cpi|unemployment)\\\\b',\n  '\\\\b(wallet|custody|cold\\\\s+storage|hardware\\\\s+wallet|ledger|trezor)\\\\b',\n  '\\\\b(billion|million|trillion|market\\\\s+cap|dominance|hash\\\\s+rate|on[\\\\-\\\\s]?chain|whale|flow|moves?|movement)\\\\b',\n  '\\\\b(report|data|analysis|research|survey|study|according\\\\s+to|source|cited?|confirmed?|breaking|announc(e|ed|ement))\\\\b',\n].join('|'), 'i');\nconst RE_EMOJI = /[\\u{1F300}-\\u{1F9FF}]|[\\u{2600}-\\u{27BF}]|[\\u{FE00}-\\u{FEFF}]|[\\u{1FA00}-\\u{1FA9F}]/gu;\n\nfunction countEmoji(text) { const m = (text || '').match(RE_EMOJI); return m ? m.length : 0; }\nfunction isSpam(text) {\n  const lower = text.toLowerCase();\n  if (RE_ENGAGEMENT_BAIT.test(lower)) return 'engagement_bait';\n  if (RE_FINANCIAL_MANIP.test(lower)) return 'financial_manipulation';\n  if (RE_GIVEAWAY.test(lower)) return 'giveaway_scam';\n  if (RE_SUSP_LINKS.test(text)) return 'suspicious_link';\n  if (RE_BOT_COMMANDS.test(lower)) return 'bot_command';\n  if (countEmoji(text) > 6) return `emoji_flood_${countEmoji(text)}`;\n  return null;\n}\n\nconst debugLog = [];\nconst rejectionReasonCounts = {};\nfunction recordRejection(post, reasons) {\n  post.rejectionReasons = reasons;\n  for (const r of reasons) rejectionReasonCounts[r] = (rejectionReasonCounts[r] || 0) + 1;\n  debugLog.push({ sourceId: post.sourceId, text: post.text.slice(0, 70), reasons });\n}\n\nconst candidates = [];\nfor (const post of posts) {\n  const reasons = [];\n  if (RE_CONVERSATIONAL.test(post.text)) reasons.push('conversational_filler');\n\n  const spamReason = isSpam(post.text);\n  if (spamReason) reasons.push(spamReason);\n\n  // Newsworthy if the keyword regex matches OR a real coin/project was\n  // detected by name (not just cashtag) â a plain-word \"Bitcoin\" or\n  // \"Solana\" mention is a legitimate signal on its own.\n  const hasNewsSignal = RE_NEWS_SIGNAL.test(post.text) || post.detectedCoins.length > 0;\n  if (!hasNewsSignal) reasons.push('not_newsworthy');\n\n  // Engagement: missing fields are \"unknown\", not \"zero quality\". A zero\n  // total is only held against a post if it is NOT very fresh â breaking\n  // news is frequently still at zero likes/retweets in its first minutes,\n  // and must not be discarded for that reason alone.\n  const hasEngagementData = post.likesRaw != null || post.retweetsRaw != null || post.repliesRaw != null;\n  const totalEngagement = post.likes + post.retweets + post.replies;\n  const ageHoursForFilter = post.ageMinutes != null ? post.ageMinutes / 60 : null;\n  const isVeryFresh = ageHoursForFilter != null && ageHoursForFilter <= 2;\n  if (hasEngagementData && totalEngagement <= 0 && !isVeryFresh) {\n    reasons.push('zero_engagement_and_not_fresh');\n  }\n\n  const authorKey = (post.author || 'unknown').toLowerCase();\n  if (staticData.flaggedAuthors[authorKey]) reasons.push('author_on_penalty_list');\n  if (staticData.processedIds[post.sourceId]) reasons.push('duplicate_id');\n\n  if (reasons.length > 0) { recordRejection(post, reasons); continue; }\n  candidates.push(post);\n}\n\nconst authorCounts = {};\nconst filteredCandidates = [];\nfor (const c of candidates) {\n  const key = (c.author || 'unknown').toLowerCase();\n  authorCounts[key] = (authorCounts[key] || 0) + 1;\n  if (authorCounts[key] > (config.maxTweetsPerAuthor || 3)) {\n    staticData.flaggedAuthors[key] = now;\n    recordRejection(c, ['author_flood']);\n    continue;\n  }\n  filteredCandidates.push(c);\n}\n\n// ---- 6: tiered freshness classification ----\nfor (const c of filteredCandidates) {\n  const ageHours = c.ageMinutes != null ? c.ageMinutes / 60 : null;\n  if (ageHours == null) {\n    c.trendLevel = 'unusable_as_primary_missing_timestamp';\n    c.freshnessTier = null;\n  } else if (ageHours < -5 / 60) {\n    // A few minutes of clock skew is tolerated; further in the future is not.\n    c.trendLevel = 'unusable_as_primary_future_timestamp';\n    c.freshnessTier = null;\n  } else {\n    const tier = FRESHNESS_TIERS.find((t) => ageHours <= t.maxHours);\n    if (tier) { c.trendLevel = tier.trendLevel; c.freshnessTier = tier.name; }\n    else { c.trendLevel = 'stale'; c.freshnessTier = null; }\n  }\n}\n\n// ---- 8: cluster by event/topic similarity, not token alone ----\nconst STOPWORDS = new Set(['about', 'after', 'their', 'there', 'which', 'would', 'could', 'should', 'crypto', 'market', 'because', 'before', 'still', 'while', 'where', 'these', 'those', 'other', 'being']);\nfunction extractKeywords(text) {\n  const words = text.toLowerCase().match(/[a-z]{4,}/g) || [];\n  return [...new Set(words.filter((w) => !STOPWORDS.has(w)))];\n}\nfunction sharedKeywordCount(a, b) {\n  const setB = new Set(b);\n  let shared = 0;\n  for (const w of a) if (setB.has(w)) shared++;\n  return shared;\n}\n\nfor (const c of filteredCandidates) c.keywords = extractKeywords(c.text);\n\nconst clusters = [];\nfor (const c of filteredCandidates) {\n  let placed = false;\n  for (const cluster of clusters) {\n    const rep = cluster[0];\n    const sameToken = Boolean(c.token) && c.token === rep.token;\n    const threshold = sameToken ? CLUSTER_MIN_SHARED_KEYWORDS_SAME_TOKEN : CLUSTER_MIN_SHARED_KEYWORDS_NO_TOKEN_MATCH;\n    if (sharedKeywordCount(c.keywords, rep.keywords) >= threshold) {\n      cluster.push(c);\n      placed = true;\n      break;\n    }\n  }\n  if (!placed) clusters.push([c]);\n}\nfor (const cluster of clusters) for (const c of cluster) c.clusterMembers = cluster;\n\n// ---- 9: score (recency uses a shared 48h ceiling so tier2/tier3 posts still earn partial credit) ----\nfunction scoreCandidate(c) {\n  const ageHours = c.ageMinutes != null ? Math.max(c.ageMinutes / 60, 0.05) : null;\n  const engagement = Math.log10(1 + c.likes * 1 + c.retweets * 2 + c.replies * 1.5 + (c.quotes || 0) * 1.5) * 20;\n  const velocity = ageHours != null ? Math.log10(1 + (c.likes + c.retweets * 2 + c.replies) / ageHours) * 25 : 0;\n  const recency = ageHours != null && ageHours >= 0 ? Math.max(0, RECENCY_CEILING_HOURS - ageHours) / RECENCY_CEILING_HOURS * 20 : 0;\n  const newsworthiness = RE_NEWS_SIGNAL.test(c.text) ? 15 : (c.detectedCoins.length > 0 ? 10 : 0);\n  const clusterSize = (c.clusterMembers || [c]).length;\n  const confirmation = Math.min(clusterSize - 1, 4) * 8;\n  const sourceQuality = (c.authorVerified ? 8 : 0) + (c.authorFollowers && c.authorFollowers > 10000 ? 5 : 0);\n  // A very fresh post from a verified/established account still needs to be\n  // able to win before engagement accumulates â a small, capped freshness\n  // grace credit, not a substitute for the recency score itself.\n  const freshnessGrace = (c.trendLevel === 'breaking' && c.authorVerified) ? 6 : 0;\n  const penalties = ageHours == null ? -10 : 0;\n\n  const breakdown = {\n    engagement: Math.round(engagement * WEIGHTS.engagement),\n    velocity: Math.round(velocity * WEIGHTS.velocity),\n    recency: Math.round(recency * WEIGHTS.recency),\n    newsworthiness: Math.round(newsworthiness * WEIGHTS.newsworthiness),\n    confirmation: Math.round(confirmation * WEIGHTS.confirmation),\n    sourceQuality: Math.round(sourceQuality * WEIGHTS.sourceQuality),\n    freshnessGrace,\n    penalties,\n  };\n  return { total: Object.values(breakdown).reduce((a, b) => a + b, 0), breakdown, clusterSize };\n}\n\nfor (const c of filteredCandidates) {\n  const { total, breakdown, clusterSize } = scoreCandidate(c);\n  c.trendScore = total;\n  c.scoreBreakdown = breakdown;\n  c.clusterSize = clusterSize;\n}\nfilteredCandidates.sort((a, b) => b.trendScore - a.trendScore);\n\n// ---- 10-11: select winner tier by tier, evergreen only if nothing in any tier qualifies ----\nlet winner = null;\nfor (const tier of FRESHNESS_TIERS) {\n  const tierCandidates = filteredCandidates\n    .filter((c) => c.freshnessTier === tier.name)\n    .sort((a, b) => b.trendScore - a.trendScore);\n  const found = tierCandidates.find((c) => c.trendScore >= (config.minTrendScoreToWin || 25));\n  if (found) { winner = found; break; }\n}\n\nconst EVERGREEN_LIBRARY = [\n    { topic: 'Bitcoin Halving Cycles', angle: 'How supply shocks historically preceded bull markets and what to watch for next.', token: 'BTC' },\n    { topic: 'DeFi Yield Strategies', angle: 'A beginner-friendly breakdown of liquidity pools, staking, and risk management.', token: 'GENERAL_MARKET' },\n    { topic: 'Layer-2 Scaling Solutions', angle: 'Why Ethereum L2s matter and how they reduce fees while maintaining security.', token: 'ETH' },\n    { topic: 'Crypto Portfolio Diversification', angle: 'The 80/20 rule for digital assets: core holdings vs. high-risk bets.', token: 'GENERAL_MARKET' },\n    { topic: 'Understanding Market Cycles', angle: 'Fear & greed index deep-dive - how sentiment drives price action.', token: 'GENERAL_MARKET' },\n    { topic: 'NFT Utility Beyond JPEGs', angle: 'Real-world use cases: ticketing, IP ownership, and gaming assets.', token: 'GENERAL_MARKET' },\n    { topic: 'Stablecoins Explained', angle: 'USDC vs. USDT vs. algorithmic stables - risks and trade-offs.', token: 'GENERAL_MARKET' },\n    { topic: 'On-Chain Data Analysis', angle: 'How to read wallet movements and exchange flows to spot smart money.', token: 'GENERAL_MARKET' },\n    { topic: 'Web3 Identity & Wallets', angle: 'Self-custody vs. exchanges: why your keys matter more than ever.', token: 'GENERAL_MARKET' },\n    { topic: 'Tokenomics 101', angle: 'Supply schedules, vesting cliffs, and why they make or break a project.', token: 'GENERAL_MARKET' },\n    { topic: 'Cross-Chain Bridges', angle: 'How assets move between blockchains and the security risks involved.', token: 'GENERAL_MARKET' },\n    { topic: 'Ethereum Proof-of-Stake', angle: 'How the Merge changed ETH issuance, validators, and environmental impact.', token: 'ETH' },\n    { topic: 'Solana vs. Ethereum', angle: 'Speed vs. decentralisation - an honest comparison for developers and traders.', token: 'SOL' },\n    { topic: 'Crypto Tax Basics', angle: 'What counts as a taxable event and how to keep records without going mad.', token: 'GENERAL_MARKET' },\n    { topic: 'DAO Governance Explained', angle: 'How decentralised organisations make decisions - and where they still fail.', token: 'GENERAL_MARKET' },\n    { topic: 'Dollar-Cost Averaging in Crypto', angle: 'Why mechanical buying beats timing the market for 90% of retail investors.', token: 'GENERAL_MARKET' },\n    { topic: 'AI + Blockchain Convergence', angle: 'Projects combining machine learning with on-chain data and what that enables.', token: 'GENERAL_MARKET' },\n    { topic: 'Smart Contract Security', angle: 'Common exploit patterns (reentrancy, flash loans) and how audits catch them.', token: 'GENERAL_MARKET' },\n    { topic: 'Central Bank Digital Currencies', angle: 'How CBDCs differ from crypto and what they mean for financial privacy.', token: 'GENERAL_MARKET' },\n    { topic: 'Bull vs. Bear Market Psychology', angle: 'Cognitive biases - FOMO, anchoring, loss aversion - and how to counter them.', token: 'GENERAL_MARKET' },\n  ];\n\nlet mode, selected;\nif (winner) {\n  mode = 'TREND_MODE';\n  selected = {\n    text: winner.text,\n    token: winner.token || 'GENERAL_MARKET',\n    likes: winner.likes, retweets: winner.retweets, replies: winner.replies,\n    score: winner.trendScore, scoreBreakdown: winner.scoreBreakdown, sourceId: winner.sourceId,\n    supportingSourceIds: (winner.clusterMembers || []).filter((c) => c.sourceId !== winner.sourceId).map((c) => c.sourceId),\n    clusterSize: winner.clusterSize,\n  };\n} else {\n  mode = 'EVERGREEN_MODE';\n  const usedRecently = new Set(Object.keys(staticData.recentTopicHashes));\n  const available = EVERGREEN_LIBRARY.filter((t) => !usedRecently.has(t.topic));\n  const pool = available.length > 0 ? available : EVERGREEN_LIBRARY;\n  const topic = pool[Math.floor(Math.random() * pool.length)];\n  selected = { text: topic.angle, token: topic.token, evergreenTopic: topic.topic, evergreenAngle: topic.angle, likes: 0, retweets: 0, replies: 0, score: 0 };\n}\n\n// ---- 12: rich debug output (Â§8) without breaking any field AI Agent/downstream nodes already rely on ----\nconst highestScore = filteredCandidates.length > 0 ? filteredCandidates[0].trendScore : null;\nconst debugInfo = {\n  totalRawResults,\n  totalTweetObjectsParsed,\n  candidateCount: filteredCandidates.length,\n  rejectedCount: posts.length - filteredCandidates.length,\n  rejectionReasonCounts,\n  highestScore,\n  selectedScore: winner ? winner.trendScore : null,\n  selectedText: winner ? winner.text : null,\n  selectedSourceId: winner ? winner.sourceId : null,\n  selectedSourceUrl: winner ? winner.sourceUrl : null,\n  selectedAuthor: winner ? winner.author : null,\n  selectedCreatedAt: winner ? winner.createdAt : null,\n  selectedAgeHours: winner && winner.ageMinutes != null ? Math.round((winner.ageMinutes / 60) * 100) / 100 : null,\n  selectedToken: winner ? winner.token : null,\n  selectedMode: mode,\n  scoreBreakdown: winner ? winner.scoreBreakdown : null,\n  apiResponseShapeDetected,\n  searchQueryUsed: config.searchQueryUsed || null,\n};\n\nreturn [{ json: { ...config, contentStatus: 'ok', mode, ...selected, debugLog, ...debugInfo } }];\n"
+      },
+      "id": "b8813197-66c4-47f7-943d-d859f05871e4",
+      "name": "Normalize, Filter & Select Trend",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        496,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a viral financial content scriptwriter for TikTok and Instagram Reels. Your audience is 18-34 year-old English speakers in the US, UK, and Canada who are crypto-native, financially literate, and allergic to corporate BS. They follow markets the way others follow sports. They use terms like \"rekt,\" \"aping in,\" \"degen,\" \"diamond hands,\" \"ngmi,\" and \"this is the way\" naturally.\n\nTODAY'S DATE: {{ $now.toFormat('MMMM d, yyyy') }}\nCURRENT YEAR: {{ $now.year }}\n\n============ TEMPORAL INTELLIGENCE - READ FIRST ============\nYou are always operating in real-time as of {{ $now.toFormat('MMMM yyyy') }}. Before writing a single word, classify every data point in the source material:\nCURRENT: Any event, price, or development dated within the last 30 days of {{ $now.toFormat('MMMM d, yyyy') }}. Treat this as live, present-tense, urgent.\nRECENT: Anything from the last 3-12 months. Reference with \"earlier this year\" or \"over the past few months.\" Never present as breaking.\nHISTORICAL: Anything older than 12 months. Reframe as historical context only - \"back in [year],\" \"when this last happened in [year].\" NEVER present old data as current.\nIf the source data contains no explicit date, assume it may be outdated and write accordingly. Do not fabricate recency.\n\n============ CORE IDENTITY ============\nYou are NOT a financial advisor. You are a trusted friend who understands markets - the person everyone DMs when something big breaks. Quick, sharp, direct. No padding. No unnecessary hedging.\nYour register: Bloomberg Terminal meets group chat. You cite numbers, name institutions, reference real mechanics - but deliver it like a text message, not a press release.\n\n============ STRICT WORD COUNT - NON-NEGOTIABLE ============\nTREND_MODE: 60 words maximum. Count every word before outputting.\nEVERGREEN_MODE: 90 words maximum. Count every word before outputting.\nIf your word count exceeds these limits, your output is invalid. Recount and rewrite before outputting.\n\n============ MODE RULES ============\n-- TREND_MODE - 60 WORDS MAX --\nLead with the most shocking number or fact first. Name the specific asset, institution, or protocol - never be vague. Use present tense, active verbs. Fast hook, then context, then what to watch next, then a bridge sentence.\n\n-- EVERGREEN_MODE - 90 WORDS MAX --\nOpen with a reframe or surprising insight, never a definition. Use relatable analogies for mechanics. Surprising hook, then a reframe or mechanic, then a practical takeaway, then a bridge sentence.\n\n============ THE HOOK - NON-NEGOTIABLE ============\nFirst sentence only. Under 8 words. Must do ONE of:\nState a number that sounds insane. Flip an assumption. Create urgency with specificity. Make it personal. Ask a question that makes them feel behind.\nNo greetings. No \"Hey guys.\" No \"So...\" No vague openers.\nIf source data is from a prior year, anchor it: \"Back in [year], this happened - and the same setup is forming right now.\"\n\n============ LANGUAGE RULES ============\nAPPROVED: rekt, ape in, degen, ngmi, wagmi, diamond hands, paper hands, wen, ser, CT, hodl, bags, shakeout, capitulation, bear trap, bull run, on-chain, front-run, liquidity, volatility, dominance, market cap, TVL, open interest, funding rates, leverage, liquidation, halving.\nBANNED: \"In the world of crypto\" / \"It's important to note\" / \"Let's dive in\" / \"Let's break this down\" / \"In recent years\" / \"In recent news\" / \"Many investors believe\" / \"Experts say\" / \"cryptocurrency\" used more than once / \"As we know\" / \"Exciting times\" / \"Revolutionary\" / \"Game-changing\" / \"Disruptive\" / any sentence starting with \"So basically.\"\n\n============ TTS CLEAN SCRIPT RULES ============\nThe script field goes directly into a text-to-speech engine. It must be pure spoken audio with zero contamination:\nNO stage directions, no (pause), no [beat], no asterisk emphasis, no parentheticals.\nNO symbols: no percent signs, no dollar signs, no ampersands, no hash symbols, no arrows. Write all numbers and units as words.\nNO labels, NO headers, NO meta-text of any kind. The first character of the script value must be the first spoken word.\nNO filler after the bridge sentence. The bridge sentence is the last thing spoken.\n\n============ DISCLAIMER - MANDATORY ============\nThe disclaimer field must contain this exact string every single time, character for character:\n\"And as always - this is for educational purposes only, not financial advice. Do your own research.\"\nDo not put the disclaimer inside the script field. The script field ends with one natural bridge sentence such as \"That is the move I am watching.\" or \"Worth keeping on your radar.\"\n\n============ OUTPUT FORMAT - STRICT ============\nReturn ONLY a valid raw JSON object. No markdown fences. No preamble. No explanation.\n{\n\"script\": \"Start with the first word of your hook. Do not use any prefixes, labels, or intros.\",\n\"disclaimer\": \"And as always - this is for educational purposes only, not financial advice. Do your own research.\"\n}\nThe values for 'script' and 'disclaimer' must start with the actual text. If a label like 'Script:' appears inside the quotes, the output is failed.\n\n============ USER INPUT ============\nMODE: {{ $('Normalize, Filter & Select Trend').first().json.mode }}\nTOKEN: {{ $('Normalize, Filter & Select Trend').first().json.token }}\nRAW SOURCE DATA: {{ $('Normalize, Filter & Select Trend').first().json.text ?? $('Normalize, Filter & Select Trend').first().json.evergreenTopic }}\nSUPPORTING CONTEXT: {{ $('Normalize, Filter & Select Trend').first().json.evergreenAngle ?? 'Trending topic - use engagement signals below for urgency calibration.' }}\nENGAGEMENT SIGNALS (TREND_MODE only): Likes: {{ $('Normalize, Filter & Select Trend').first().json.likes ?? 0 }}, Retweets: {{ $('Normalize, Filter & Select Trend').first().json.retweets ?? 0 }}, Replies: {{ $('Normalize, Filter & Select Trend').first().json.replies ?? 0 }}, Score: {{ $('Normalize, Filter & Select Trend').first().json.score ?? 0 }}\n\n{{ $json.retryNote ? ('IMPORTANT - REGENERATION NOTICE: ' + $json.retryNote) : '' }}\n\nGenerate a {{ $('Normalize, Filter & Select Trend').first().json.mode === 'TREND_MODE' ? 'TREND_MODE script - 60 words maximum' : 'EVERGREEN_MODE script - 90 words maximum' }} for this content. The hook must reference the most compelling fact or number in the source data. Count your words before outputting. Output raw JSON only. No explanation.\n\n============ SELF-CHECK BEFORE OUTPUT ============\nDid I count every word in the script field? Is it under the word limit for this mode? Does the script field begin immediately with the first spoken word, no label, no prefix? Is the script free of every banned phrase and every TTS-breaking symbol? Does the script field end with one bridge sentence and nothing after it? Does the disclaimer field contain the exact required string? Is the output raw JSON with exactly two keys and nothing outside the object?\nIf any answer is no, rewrite before outputting.",
+        "options": {
+          "systemMessage": ""
+        }
+      },
+      "id": "0c8528bc-220f-4f57-ab00-898c483e715e",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        752,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "model": "llama-3.1-8b-instant",
+        "options": {
+          "maxTokensToSample": 2800
+        }
+      },
+      "id": "d13ad4e1-eec9-4447-92dc-28e7cf25d717",
+      "name": "Groq Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        752,
+        656
+      ],
+      "credentials": {
+        "groqApi": {
+          "id": "REPLACE_WITH_YOUR_N8N_CREDENTIAL_ID",
+          "name": "Groq account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const trend = $('Normalize, Filter & Select Trend').first().json;\nconst jobId = $('Job Config').first().json.jobId;\n\n// Attempt count is derived purely from THIS execution's own graph data â\n// specifically, the previous loop pass's \"Script Route\" output â never from\n// workflow static data ($getWorkflowStaticData). Static data is a\n// cross-execution DB-backed store; on a freshly imported/unsaved workflow,\n// or under a plain manual execution, mutations written earlier in the very\n// same run are not reliably visible to later nodes (this is the confirmed\n// root cause of the \"Cannot read properties of undefined\" crash that used\n// to happen in Prepare Job Manifest). $('Script Route') is a completely\n// different mechanism â n8n's own per-execution pairedItem graph â and is\n// unaffected by that persistence issue; it's the same kind of reference\n// Convert Text to Speech already uses successfully to read this node's\n// latest (valid) output.\nfunction getPreviousAttempt() {\n  try {\n    const prev = $('Script Route').first().json;\n    return prev && typeof prev.attempt === 'number' ? prev.attempt : 0;\n  } catch (e) {\n    return 0; // Script Route has not run yet this execution -> this is attempt 1\n  }\n}\nconst attempt = getPreviousAttempt() + 1;\n\nfunction routeFail(reason) {\n  const maxAttempts = trend.maxGroqAttempts || 2;\n  if (attempt < maxAttempts) {\n    return [{\n      json: {\n        route: 'retry',\n        jobId,\n        attempt,\n        retryNote: `Your previous attempt was rejected: ${reason}. Follow the rules exactly this time â do not repeat this mistake.`,\n      },\n    }];\n  }\n  return [{ json: { route: 'failed', jobId, reason } }];\n}\n\nconst raw = $json.output ?? $json.text ?? '';\nif (!raw || typeof raw !== 'string') return routeFail('AI Agent returned empty output');\n\nconst cleaned = raw\n  .replace(/^```json\\s*/i, '')\n  .replace(/^```\\s*/i, '')\n  .replace(/```\\s*$/i, '')\n  .trim();\n\nlet parsed;\ntry {\n  parsed = JSON.parse(cleaned);\n} catch (e) {\n  return routeFail(`JSON parse failed: ${e.message}`);\n}\n\nlet script = parsed.script;\nif (!script || typeof script !== 'string') return routeFail('Missing script field');\nif (!parsed.disclaimer || typeof parsed.disclaimer !== 'string') return routeFail('Missing disclaimer field');\n\nscript = script.replace(/^[A-Za-z\\s]{1,30}:\\s*/i, '');\nscript = script.replace(/\\(.*?\\)/g, '');\nscript = script.replace(/\\[.*?\\]/g, '');\nscript = script.replace(/\\*.*?\\*/g, '');\nscript = script.replace(/And as always[\\s\\S]*?Do your own research\\.?/gi, '');\nscript = script.replace(/\\s{2,}/g, ' ').trim();\n\nconst disclaimer = 'And as always â this is for educational purposes only, not financial advice. Do your own research.';\n\nconst wordCount = script.split(/\\s+/).filter(Boolean).length;\nconst maxWords = trend.mode === 'EVERGREEN_MODE' ? 90 : 60;\nif (wordCount === 0) return routeFail('Script is empty after cleaning');\nif (wordCount > maxWords) return routeFail(`Script exceeds ${maxWords}-word limit (${wordCount} words)`);\n\nconst BANNED_PHRASES = [\n  'in the world of crypto', \"it's important to note\", \"let's dive in\", \"let's break this down\",\n  'in recent years', 'in recent news', 'many investors believe', 'experts say',\n  'as we know', 'exciting times', 'revolutionary', 'game-changing', 'disruptive', 'so basically',\n];\nconst lowerScript = script.toLowerCase();\nconst foundBanned = BANNED_PHRASES.find((p) => lowerScript.includes(p));\nif (foundBanned) return routeFail(`Contains banned phrase: \"${foundBanned}\"`);\n\n// Valid â downstream nodes (Convert Text to Speech, Prepare Job Manifest,\n// Prepare Manual Upload Package) all read the script/disclaimer straight\n// off $('Parse & Validate Script').first() themselves, via n8n's own\n// per-execution reference mechanism. Nothing needs to be stashed in\n// workflow static data for this execution to see it.\nreturn [{ json: { route: 'valid', jobId, script, disclaimer, wordCount, attempt } }];"
+      },
+      "id": "19b81331-9252-4fa2-86b1-bb9b120b38a4",
+      "name": "Parse & Validate Script",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1024,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "valid",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "retry",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "failed",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "99fc8cfb-84e5-4168-af0f-f7e6cae419f6",
+      "name": "Script Route",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        1264,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.elevenlabs.io/v1/text-to-speech/{{ $env.ELEVENLABS_VOICE_ID }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "elevenLabsApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "audio/mpeg"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n  {\n    text: $('Parse & Validate Script').first().json.script + ' ' + $('Parse & Validate Script').first().json.disclaimer,\n    model_id: 'eleven_multilingual_v2',\n    voice_settings: {\n      stability: 0.5,\n      similarity_boost: 0.75,\n      style: 0,\n      use_speaker_boost: true,\n      speed: 1\n    }\n  }\n}}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          },
+          "timeout": 120000
+        }
+      },
+      "id": "fcef2e2d-8678-49d8-b3dc-d8a49486fcd4",
+      "name": "Convert Text to Speech",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1648,
+        192
+      ],
+      "credentials": {
+        "elevenLabsApi": {
+          "id": "REPLACE_WITH_YOUR_N8N_CREDENTIAL_ID",
+          "name": "ElevenLabs account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://172.17.0.1:8091/save-audio?jobId={{ encodeURIComponent($('Job Config').first().json.jobId) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-render-token",
+              "value": "={{ $env.RENDER_SERVER_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "data",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "e0c6c7ab-6327-4f06-8c63-072123fd0105",
+      "name": "Save Audio File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1840,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const jobConfig = $('Job Config').first().json;\n\n// Read the validated script/disclaimer directly off Parse & Validate\n// Script's own output â a normal n8n cross-node reference, resolved via\n// this execution's pairedItem graph, exactly like Convert Text to Speech\n// already does. This node only ever runs on the Script Route \"valid\" path\n// (valid -> Convert Text to Speech -> Save Audio File -> here), so it\n// always resolves to the SAME (latest, valid) run of Parse & Validate\n// Script that produced the script actually sent to ElevenLabs â never a\n// stale rejected attempt from an earlier Groq retry pass.\n//\n// This replaces a previous design that stashed the validated script in\n// workflow static data ($getWorkflowStaticData) keyed by jobId. That\n// mechanism is a cross-execution, DB-backed store; on a freshly imported\n// or unsaved workflow (and under plain manual executions generally),\n// writes made earlier in the very same run are not reliably visible to\n// later nodes, which was the exact cause of a \"Cannot read properties of\n// undefined\" crash here. Static data is still used elsewhere in this\n// workflow, but only for genuinely cross-execution history (dedup /\n// recently-used-topics), never as a same-run transport like this was.\nconst validated = $('Parse & Validate Script').first().json;\nif (!validated || typeof validated.script !== 'string' || typeof validated.disclaimer !== 'string') {\n  throw new Error(`Prepare Job Manifest: could not resolve a validated script/disclaimer for job ${jobConfig.jobId} from Parse & Validate Script's output.`);\n}\n\nconst manifest = {\n  jobId: jobConfig.jobId,\n  script: validated.script,\n  disclaimer: validated.disclaimer,\n  audioRelPath: `jobs/${jobConfig.jobId}/narration.mp3`,\n};\n\nreturn [{ json: { ...jobConfig, ...manifest } }];"
+      },
+      "id": "af7ed207-a1cf-4a46-9d1c-6b6a6157750a",
+      "name": "Prepare Job Manifest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2032,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://172.17.0.1:8091/save-manifest?jobId={{ encodeURIComponent($json.jobId) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-render-token",
+              "value": "={{ $env.RENDER_SERVER_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { jobId: $json.jobId, script: $json.script, disclaimer: $json.disclaimer, audioRelPath: $json.audioRelPath } }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "39aa7f70-952c-4b95-a468-fd33ce1c4092",
+      "name": "Save Job Manifest",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2224,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=http://172.17.0.1:8091/render?jobId={{ encodeURIComponent($('Job Config').first().json.jobId) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-render-token",
+              "value": "={{ $env.RENDER_SERVER_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "9a850355-1767-41a3-812c-f2e8f6d5eb5d",
+      "name": "Render Video",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2416,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nif (!staticData.processedIds) staticData.processedIds = {};\nif (!staticData.recentTopicHashes) staticData.recentTopicHashes = {};\n\nlet trend = {};\ntry { trend = $('Normalize, Filter & Select Trend').first().json; } catch (e) { /* not reached, e.g. LOCKED before fetch never happens now â kept defensive */ }\nconst jobId = trend.jobId || $json.jobId;\n\nlet final;\nif ($json.route === 'failed') {\n  // Came straight from Script Route â no render was ever attempted, so\n  // ElevenLabs/render credits were never spent on this attempt.\n  final = { status: 'SCRIPT_VALIDATION_FAILED', jobId, error: $json.reason };\n} else if ($json && typeof $json.status === 'string') {\n  // Came from Render Video (HTTP Request to the render-server helper) â\n  // the response body is already the parsed JSON status object\n  // (VIDEO_READY / RENDER_FAILED / LOCKED / AUDIO_MISSING / etc.), not a\n  // raw stdout line, since HTTP Request auto-parses the JSON response.\n  final = $json;\n  final.jobId = final.jobId || jobId;\n} else {\n  // Defensive fallback for the old Execute Command shape, kept in case\n  // Render Video is ever pointed back at a shell command instead of HTTP.\n  const stdout = $json.stdout || '';\n  const lines = stdout.trim().split('\\n').filter(Boolean);\n  const lastLine = lines[lines.length - 1] || '{}';\n  try {\n    final = JSON.parse(lastLine);\n  } catch (e) {\n    final = { status: 'RENDER_FAILED', error: `Could not parse helper output: ${lastLine}` };\n  }\n  final.jobId = final.jobId || jobId;\n}\n\nconst now = Date.now();\nif (final.status === 'VIDEO_READY') {\n  if (trend.sourceId) staticData.processedIds[trend.sourceId] = now;\n  for (const sid of (trend.supportingSourceIds || [])) staticData.processedIds[sid] = now;\n  const topicKey = trend.evergreenTopic || trend.token || (trend.text || '').slice(0, 40);\n  if (topicKey) staticData.recentTopicHashes[topicKey] = now;\n  staticData.lastSuccessfulRun = new Date(now).toISOString();\n  staticData.lastJob = { jobId, outputPath: final.outputPath, completedAt: staticData.lastSuccessfulRun };\n  final.mode = trend.mode || null;\n  final.sourceId = trend.sourceId || null;\n}\nstaticData.lastRunStatus = { jobId, status: final.status, at: new Date(now).toISOString() };\n\nconst clean = {\n  status: final.status,\n  jobId,\n  outputPath: final.outputPath || null,\n  durationInSeconds: final.durationInSeconds || null,\n  width: final.width || null,\n  height: final.height || null,\n  fps: final.fps || null,\n  mode: final.mode || null,\n  sourceId: final.sourceId || null,\n  error: final.error || null,\n};\n\nreturn [{ json: clean }];"
+      },
+      "id": "f435208c-bbd8-45fd-9a6a-da30a0dc6d68",
+      "name": "Finalize Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2608,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Gate: only continue when the render genuinely succeeded and the MP4\n// exists. Returning an empty array halts this branch with no items â the\n// standard n8n way to stop a Code node's output without an extra IF node.\nif ($json.status !== 'VIDEO_READY' || $json.error) {\n  return [];\n}\n\nconst jobId = $json.jobId;\nconst jobConfig = $('Job Config').first().json;\n\n// The rendered MP4's container-visible path â reconstructed from Job\n// Config's own dynamic fields (never a hardcoded filename), matching the\n// bind-mounted VPS path already used by every other node in this workflow.\nconst videoPath = `${jobConfig.remotionProjectPath}/${jobConfig.outputPath}/${jobId}.mp4`;\n\n// Finalize Result intentionally strips script/topic text from its own\n// output, so pull that from where it was actually produced:\n//  - trend/topic data from \"Normalize, Filter & Select Trend\" (runs\n//    exactly once per job, outside the Groq retry loop â always safe).\n//  - the actual narrated script from \"Parse & Validate Script\", read\n//    defensively (try/catch): this node can run more than once if Groq\n//    needed a retry, and this text is only going into a human-reviewed\n//    text file (not another automated action), so a rare stale read here\n//    is low-stakes and self-correcting on review â unlike an unattended\n//    API call, which is why this project avoids this same reference\n//    elsewhere.\nconst trend = $('Normalize, Filter & Select Trend').first().json;\nlet scriptText = '';\ntry {\n  scriptText = $('Parse & Validate Script').first().json.script || '';\n} catch (e) {\n  scriptText = '';\n}\n\nfunction cleanText(text) {\n  return String(text || '').replace(/[\\r\\n]+/g, ' ').replace(/\\s{2,}/g, ' ').trim();\n}\nfunction truncate(text, max) {\n  if (text.length <= max) return text;\n  return text.slice(0, max - 1).trim() + 'â¦';\n}\n\nconst isEvergreen = trend.mode === 'EVERGREEN_MODE';\nconst CLICKBAIT_RE = /\\b(guaranteed profits?|guaranteed returns?|buy now|sell now|100x|1000x|get rich(\\s+quick)?|easy money|risk[- ]free|this coin will explode)\\b/gi;\nfunction stripClickbait(text) {\n  return String(text || '').replace(CLICKBAIT_RE, '').replace(/\\s{2,}/g, ' ').trim();\n}\n// Applied once here, up front, so every downstream use (title AND\n// description) is already clean â a banned phrase must never leak through\n// via either field.\nconst hookSource = stripClickbait(cleanText(scriptText) || cleanText(isEvergreen ? trend.evergreenAngle : trend.text));\n\n// ---- coin/topic label, reused for title, hashtags, and tags ----\nconst TICKER_TO_NAME = {\n  BTC: 'Bitcoin', ETH: 'Ethereum', SOL: 'Solana', XRP: 'XRP', DOGE: 'Dogecoin',\n  ADA: 'Cardano', AVAX: 'Avalanche', LINK: 'Chainlink', DOT: 'Polkadot',\n  LTC: 'Litecoin', MATIC: 'Polygon', TRX: 'Tron', TON: 'Toncoin', SHIB: 'Shiba Inu',\n  USDT: 'Tether', USDC: 'USD Coin',\n};\nconst rawToken = isEvergreen ? (trend.token || '') : (trend.token || '');\nconst hasRealCoin = rawToken && rawToken !== 'GENERAL_MARKET';\nconst coinName = hasRealCoin ? (TICKER_TO_NAME[rawToken] || rawToken) : '';\nconst topicLabel = isEvergreen\n  ? (trend.evergreenTopic || 'Crypto Market Update')\n  : (hasRealCoin ? coinName : 'Crypto Market');\n\n// ---- topic category detection, for hashtags/tags only (no invented facts) ----\nconst CATEGORY_PATTERNS = {\n  Regulation: /\\b(sec|regulation|regulatory|lawsuit|congress|senate|compliance|ruling|approv(al|ed)|reject(ed|ion))\\b/i,\n  Hack: /\\b(hack(ed)?|exploit(ed)?|breach|drain(ed)?|stolen|vulnerability)\\b/i,\n  ETF: /\\b(etf|spot\\s+etf|futures\\s+etf)\\b/i,\n  DeFi: /\\b(defi|liquidity|yield|staking|protocol|dex)\\b/i,\n  Exchange: /\\b(coinbase|binance|kraken|okx|bybit|exchange)\\b/i,\n};\nlet category = null;\nfor (const [name, re] of Object.entries(CATEGORY_PATTERNS)) {\n  if (re.test(hookSource)) { category = name; break; }\n}\n\n// ---- TITLE ----\nconst SHORTS_SUFFIX = ' #Shorts';\nlet titleBase = topicLabel && hookSource\n  ? `${topicLabel}: ${truncate(hookSource, 60)}`\n  : truncate(hookSource, 80) || topicLabel || 'Crypto Market Update';\ntitleBase = stripClickbait(titleBase).replace(/\\s+:/g, ':').trim();\nconst maxBase = 100 - SHORTS_SUFFIX.length;\nif (titleBase.length > maxBase) titleBase = truncate(titleBase, maxBase - 1);\nconst title = (titleBase + SHORTS_SUFFIX).trim();\n\n// ---- HASHTAGS (3-5, dynamic from the real topic) ----\nconst hashtagList = [];\nif (hasRealCoin) hashtagList.push(`#${coinName.replace(/\\s+/g, '')}`);\nif (category) hashtagList.push(`#Crypto${category}`.replace('#CryptoExchange', '#CryptoNews').replace('#CryptoDeFi', '#DeFi'));\nhashtagList.push('#CryptoNews');\nif (hashtagList.length < 3) hashtagList.push('#CryptoMarket');\nhashtagList.push('#Shorts');\nconst hashtags = [...new Set(hashtagList)].slice(0, 5);\n\n// ---- TAGS (5-10, comma list) ----\nconst tagList = ['crypto', 'cryptocurrency', 'crypto news'];\nif (hasRealCoin) {\n  tagList.push(coinName.toLowerCase());\n  tagList.push(rawToken.toLowerCase());\n}\nif (category) tagList.push(category.toLowerCase());\ntagList.push(isEvergreen ? 'crypto education' : 'crypto market update');\nconst tags = [...new Set(tagList)].slice(0, 10);\n\n// ---- DESCRIPTION ----\n// Built primarily from the already Groq-validated script text itself (not\n// re-synthesized), so nothing here can invent a fact, price, or claim that\n// wasn't already vetted earlier in the workflow.\nconst EXACT_DISCLAIMER = 'This content is for educational and informational purposes only and does not constitute financial advice. Always do your own research.';\nconst sourceLine = (!isEvergreen && trend.sourceUrl) ? `\\nSource: ${trend.sourceUrl}` : '';\nconst description = [\n  truncate(hookSource, 1000),\n  '',\n  hashtags.join(' '),\n  sourceLine.trim(),\n  '',\n  EXACT_DISCLAIMER,\n].filter((line) => line !== '').join('\\n');\n\n// ---- upload settings block (fixed text, not generated) ----\nconst uploadSettingsBlock = [\n  'Visibility: Public',\n  'Audience: Not made for kids',\n  'Language: English',\n  'Title and description language: English',\n  'Category: Education',\n  'License: Standard YouTube License',\n  'Thumbnail: Select the opening hook frame',\n].join('\\n');\n\nconst sourceInfoLine = !isEvergreen\n  ? `Live trend â token: ${trend.token || 'GENERAL_MARKET'}${trend.sourceUrl ? `, source: ${trend.sourceUrl}` : ''}${trend.author ? `, author: @${trend.author}` : ''}`\n  : `Evergreen educational topic: ${trend.evergreenTopic || topicLabel}`;\n\nconst fileContent = `==================================================\nCRYPTO FRAMES â MANUAL YOUTUBE UPLOAD PACKAGE\n==================================================\n\nJOB ID\n${jobId}\n\nTITLE\n${title}\n\nDESCRIPTION\n${description}\n\nHASHTAGS\n${hashtags.join(' ')}\n\nTAGS\n${tags.join(',')}\n\nUPLOAD SETTINGS\n${uploadSettingsBlock}\n\nVIDEO FILE\n${videoPath}\n\nSOURCE/TOPIC\n${sourceInfoLine}\n`;\n\nconst uploadDetailsFileName = `${jobId}-upload-details.txt`;\nconst binary = await this.helpers.prepareBinaryData(Buffer.from(fileContent, \"utf8\"), uploadDetailsFileName, \"text/plain\");\n\nreturn [{\n  json: {\n    jobId,\n    videoPath,\n    outputPath: jobConfig.outputPath,\n    remotionProjectPath: jobConfig.remotionProjectPath,\n    title,\n    description,\n    hashtags,\n    tags,\n    uploadDetailsFileName,\n    uploadDetailsContent: fileContent,\n  },\n  binary: { data: binary },\n}];\n"
+      },
+      "id": "cbb108b7-f965-4795-bfc8-8953fe61bd4d",
+      "name": "Prepare Manual Upload Package",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2848,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://172.17.0.1:8091/save-upload-details?jobId={{ encodeURIComponent($json.jobId) }}&videoPath={{ encodeURIComponent($json.videoPath) }}&uploadDetailsPath={{ encodeURIComponent($json.remotionProjectPath + '/' + $json.outputPath + '/' + $json.uploadDetailsFileName) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-render-token",
+              "value": "={{ $env.RENDER_SERVER_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{ $json.uploadDetailsContent }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "8ea67c6e-d25c-468e-9b9b-70159299c055",
+      "name": "Save Upload Details",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        3088,
+        192
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Job Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Job Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Job Config": {
+      "main": [
+        [
+          {
+            "node": "Fetch Crypto Posts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Crypto Posts": {
+      "main": [
+        [
+          {
+            "node": "Normalize, Filter & Select Trend",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize, Filter & Select Trend": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse & Validate Script",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Validate Script": {
+      "main": [
+        [
+          {
+            "node": "Script Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Script Route": {
+      "main": [
+        [
+          {
+            "node": "Convert Text to Speech",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert Text to Speech": {
+      "main": [
+        [
+          {
+            "node": "Save Audio File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Audio File": {
+      "main": [
+        [
+          {
+            "node": "Prepare Job Manifest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Job Manifest": {
+      "main": [
+        [
+          {
+            "node": "Save Job Manifest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Job Manifest": {
+      "main": [
+        [
+          {
+            "node": "Render Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render Video": {
+      "main": [
+        [
+          {
+            "node": "Finalize Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Result": {
+      "main": [
+        [
+          {
+            "node": "Prepare Manual Upload Package",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Manual Upload Package": {
+      "main": [
+        [
+          {
+            "node": "Save Upload Details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "00000000-0000-0000-0000-000000000000",
+  "meta": {
+    "instanceId": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "nodeGroups": [],
+  "id": "content-production-workflow",
+  "tags": []
+}

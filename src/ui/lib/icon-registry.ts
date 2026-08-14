@@ -1,0 +1,127 @@
+import type { ComponentType } from "react";
+import {
+  AlertTriangle,
+  Activity,
+  Banknote,
+  Bot,
+  BrainCircuit,
+  Briefcase,
+  Building,
+  Building2,
+  Calculator,
+  Calendar,
+  CandlestickChart,
+  Circle,
+  Clock,
+  Cloud,
+  Coins,
+  CreditCard,
+  Cpu,
+  Database,
+  FileText,
+  Gem,
+  Globe,
+  Grid3x3,
+  LayoutDashboard,
+  Landmark,
+  Laptop,
+  LineChart,
+  Lock,
+  MonitorSmartphone,
+  Network,
+  Percent,
+  PieChart,
+  Rocket,
+  Search,
+  Server,
+  ShieldAlert,
+  ShieldCheck,
+  Smartphone,
+  Sparkles,
+  TrendingDown,
+  TrendingUp,
+  TriangleAlert,
+  Users,
+  Wallet,
+} from "lucide-react";
+import {
+  SiBinance,
+  SiBitcoin,
+  SiCardano,
+  SiDogecoin,
+  SiEthereum,
+  SiRipple,
+  SiSolana,
+  SiTether,
+} from "@icons-pack/react-simple-icons";
+
+export type IconComponent = ComponentType<{
+  size?: number | string;
+  color?: string;
+  strokeWidth?: number;
+}>;
+
+/** Generic finance/markets/business/AI/economics/warning/opportunity icons — the shared reusable vocabulary. */
+const TOPIC_ICONS: Record<string, IconComponent> = {
+  Wallet,
+  PieChart,
+  LayoutDashboard,
+  Banknote,
+  Coins,
+  Landmark,
+  CreditCard,
+  Calculator,
+  CandlestickChart,
+  LineChart,
+  Grid3x3,
+  MonitorSmartphone,
+  Percent,
+  Activity,
+  Briefcase,
+  Building2,
+  Building,
+  Users,
+  Rocket,
+  Cpu,
+  BrainCircuit,
+  Network,
+  Bot,
+  TrendingDown,
+  TrendingUp,
+  Shield: ShieldCheck,
+  ShieldAlert,
+  ShieldCheck,
+  TriangleAlert,
+  Lock,
+  AlertTriangle,
+  Sparkles,
+  Circle,
+  Server,
+  Cloud,
+  Database,
+  Laptop,
+  Smartphone,
+  Gem,
+  FileText,
+  Globe,
+  Calendar,
+  Clock,
+  Search,
+};
+
+/** Real brand logos — keyed the same way CryptoAsset.iconSlug already is ("SiBitcoin", ...). */
+const BRAND_ICONS: Record<string, IconComponent> = {
+  SiBitcoin,
+  SiEthereum,
+  SiSolana,
+  SiRipple,
+  SiDogecoin,
+  SiCardano,
+  SiTether,
+  SiBinance,
+};
+
+/** Single resolver for any icon name string produced anywhere in the entity/accent system — a lucide topic name or a simple-icons brand slug. Falls back to a plain circle, never throws. */
+export function resolveIcon(name: string): IconComponent {
+  return TOPIC_ICONS[name] ?? BRAND_ICONS[name] ?? Circle;
+}

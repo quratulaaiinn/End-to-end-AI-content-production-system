@@ -1,0 +1,32 @@
+# Dependencies
+node_modules
+
+# Build / bundler output
+dist
+.cache
+
+# Remotion render output
+out
+public/jobs
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Archives / backups
+*.bak
+*.tmp
+*.zip
+*.tar
+*.tar.gz

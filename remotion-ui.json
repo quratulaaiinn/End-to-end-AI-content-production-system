@@ -1,0 +1,10 @@
+{
+  "preset": "default",
+  "aliases": {
+    "primitives": "@/ui/primitives",
+    "scenes": "@/ui/scenes",
+    "compositions": "@/compositions",
+    "lib": "@/ui/lib",
+    "hooks": "@/ui/hooks"
+  }
+}
