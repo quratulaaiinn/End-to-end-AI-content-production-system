@@ -2,6 +2,10 @@
 
 An automated pipeline that turns a live trending topic into a finished, narrated vertical video — from content discovery to a packaged, downloadable MP4.
 
+## Demo
+
+[Watch a sample output](docs/demo-video.mp4) — generated end-to-end by the pipeline: trend selection, script generation, ElevenLabs narration, and Remotion rendering, with no manual editing afterward.
+
 ## Overview
 
 This project automates the production side of short-form video content: it finds a worthwhile topic, writes and validates a script with an LLM, generates narration audio, and renders a fully animated video through a custom Remotion engine. Orchestration runs in n8n; the ranking logic, script validation, and the video renderer itself are custom code.
