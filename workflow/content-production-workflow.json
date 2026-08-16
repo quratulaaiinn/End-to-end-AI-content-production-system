@@ -259,7 +259,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{\n  {\n    text: $('Parse & Validate Script').first().json.script + ' ' + $('Parse & Validate Script').first().json.disclaimer,\n    model_id: 'eleven_multilingual_v2',\n    voice_settings: {\n      stability: 0.5,\n      similarity_boost: 0.75,\n      style: 0,\n      use_speaker_boost: true,\n      speed: 1\n    }\n  }\n}}",
+        "jsonBody": "={{\n  {\n    text: $('Parse & Validate Script').first().json.script + ' ' + $('Parse & Validate Script').first().json.disclaimer,\n    model_id: 'eleven_multilingual_v2',\n    voice_settings: {\n      stability: 0.38,\n      similarity_boost: 0.32,\n      style: 0.20,\n      use_speaker_boost: true,\n      speed: 1.10\n    }\n  }\n}}",
         "options": {
           "response": {
             "response": {
