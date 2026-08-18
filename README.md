@@ -72,7 +72,7 @@ Everything left of `render-server` is n8n orchestration. Everything at and right
 | Remotion | Programmatic video rendering (compositions, transitions, audio sync, headless render/ffprobe) |
 | Tailwind CSS v4 | Styling within Remotion components |
 | Zod | Runtime schema validation for composition props |
-| Groq | LLM inference (`llama-3.1-8b-instant`) for script generation |
+| Groq | LLM inference (`openai/gpt-oss-20b`) for script generation |
 | ElevenLabs | Text-to-speech narration |
 | RapidAPI | Third-party data source for content discovery |
 | Docker | Containerized n8n, bridged to the host-side render service |
